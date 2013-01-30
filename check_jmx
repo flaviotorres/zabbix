@@ -1,0 +1,25 @@
+#!/bin/bash
+# ./check_jmx
+# Realiza uma conexao JMX e imprime os dados dos MBeans
+# Flavio Torres, ftorres[at]ymail.com
+# v1, Maio/2012
+
+HOST=$1
+OBJETO="$2"
+ATRIBUTO="$3"
+BASEDIR=$(dirname $0)
+
+Help(){ 
+        echo ""
+        echo "Uso: $0 HOST OBJETO ATRIBUTO"
+        echo "Ex: $0 HOST:16101 solr/:type=search,id=org.apache.solr.handler.component.SearchHandler avgRequestsPerSecond"
+        echo ""
+}
+
+Main(){
+RET=$(java -jar $BASEDIR/cmdline-jmxclient-0.10.3.jar - $HOST $OBJETO $ATRIBUTO 2>&1)
+echo $RET |awk -F${ATRIBUTO}: '{gsub(/ /,"",$2); print $2}'
+}
+
+[ -z "$1" -o -z "$2" ] && Help || Main
+
