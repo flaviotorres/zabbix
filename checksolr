@@ -1,0 +1,253 @@
+#!/bin/bash
+
+# This script will get the list af active cores and issues a ping request to them.
+# If a single request failes, the check will return ERROR
+# All requests must return OK
+
+
+# Local variables
+APP="`basename "$0"`"
+EXIT_CODE=0
+SOLR_HOST="localhost"
+SOLR_HOST_PORT="8983"
+SOLR_SLAVE="NO"
+# Last replication event must have been at least xxx sec ago.
+SOLR_TIME_DIFF=7200
+OUT=""
+
+set -u
+
+# If no arguments are given
+if [ "$#" -eq 0 ]
+then
+  pod2usage "$0"
+  exit 1
+fi
+    
+# Parse arguments
+while [ $# -gt 0 ]
+do
+  case "$1" in
+    --help|-h|-\?)
+      pod2usage -verbose 1 "$0"
+      exit 1
+    ;;
+                          
+    --man)
+      pod2usage -verbose 2 "$0"
+      exit 1
+    ;;
+    
+    --host|-H)
+      SOLR_HOST="$2"
+      shift 2
+    ;;
+    
+    --port|-P)
+      SOLR_HOST_PORT="$2"
+      shift 2
+    ;;
+    
+    --diff|-D)
+      SOLR_TIME_DIFF="$2"
+      shift 2
+    ;;
+    
+    --slave)
+      SOLR_SLAVE="YES"
+      shift 
+    ;;
+    
+    *)
+      # Non option argument
+      break # Finish for loop
+    ;;
+    
+  esac
+
+done
+                
+# main code
+[ -n "$SOLR_HOST" ] || {
+  echo "UNKNOWN: --host argument is not set"
+  exit 3
+}
+
+# Get the list of defined cores in XML format.
+SOLR_CORES=`curl --max-time 15 --fail --silent http://${SOLR_HOST}:${SOLR_HOST_PORT}/solr/admin/cores`
+
+[ "$?" == "0" ] || {
+  echo "CRITICAL: server \"$SOLR_HOST\" is not responding or returned incorrect data."
+  exit 2
+}
+
+# Re-format XML and strip out only the list of cores
+
+SOLR_CORES=`echo ${SOLR_CORES} | xmllint --format - | egrep 'lst name="(search|discount)"' | sed -e 's/<.*="//g' -e 's/">//g'`
+
+[ -n "$SOLR_CORES"  ] || {
+  echo "CRITICAL: server \"$SOLR_HOST\" returned an empty list of cores."
+  exit 2
+}
+
+for CORE in $SOLR_CORES
+do
+  if [ "$SOLR_SLAVE" == "NO" ]
+  then 
+    RESULT=`curl --max-time 10 --silent http://${SOLR_HOST}:${SOLR_HOST_PORT}/solr/${CORE}/admin/ping | xmllint --format - | grep ' <str name="status"'| sed -e 's/<str name="status">//g' -e 's/<\/str>//g' -e 's/^[ \t]*//;s/[ \t]*$//'`
+    OUT="${OUT}Core \"${CORE}\" returned \"${RESULT}\".\n"
+    [ "$RESULT"  == "OK" ] || EXIT_CODE=1
+  else
+    #Verifying replication health is harder, so there will be several checks.
+    # 1) Check if master host is defined.
+    # 2) Check indexReplicatedAtList and compare it with replicationFailedAtList. This will determine if replication is working.
+    # 3) Check if indexReplicatedAtList is more then 2 hours behind now().  If it is then something might be wrong.
+    # 4) Check if indexVersion on master and slave match.
+    SOLR_SLAVE_DETAILS=`curl --max-time 10 --silent http://${SOLR_HOST}:${SOLR_HOST_PORT}/solr/${CORE}/replication?command=details`
+    # Get the URL to the corresponding master core
+    SOLR_SLAVE_MASTERURL=`echo "$SOLR_SLAVE_DETAILS" | xmlstarlet sel -t -v "/response/lst[@name='details']/lst[@name='slave']/str[@name='masterUrl']"`
+
+    if [ -n "$SOLR_SLAVE_MASTERURL" ]
+    then
+      # masterUrl is set, so continue with the next check.
+      
+      # Get the master index version
+      SOLR_MASTER_INDEXVERSION=`curl --max-time 10 --silent "$SOLR_SLAVE_MASTERURL"'?command=indexversion' | xmlstarlet sel -t -v "/response/long[@name='indexversion']" `
+      
+      # Get slave index version
+      SOLR_SLAVE_INDEXVERSION=`echo "$SOLR_SLAVE_DETAILS" | xmlstarlet sel -t -v "/response/lst[@name='details']/long[@name='indexVersion']"`
+      
+      # Get the last time the core replicated correctly.
+      SOLR_SLAVE_REPLICATEDAT=`echo "$SOLR_SLAVE_DETAILS" | xmlstarlet sel -t -v "/response/lst[@name='details']/lst[@name='slave']/arr[@name='indexReplicatedAtList']/str"`
+      
+      # Get the last time the core failed to replicate.
+      SOLR_SLAVE_FAILEDAT=`echo "$SOLR_SLAVE_DETAILS" | xmlstarlet sel -t -v "/response/lst[@name='details']/lst[@name='slave']/arr[@name='replicationFailedAtList']/str"`
+      
+      # Is this core replicating (aka pulling index from master) right now?
+      SOLR_SLAVE_REPLICATING=`echo "$SOLR_SLAVE_DETAILS" | xmlstarlet sel -t -v "/response/lst[@name='details']/lst[@name='slave']/str[@name='isReplicating']"`
+      
+      # If SOLR_SLAVE_REPLICATEDAT is empty then the instance has not replicated once, this is an error.
+      # Actually it's possible that this check will cause a false alert if the index is being replicated for the first time just now, so check for this also.
+      if [ -z "$SOLR_SLAVE_FAILEDAT" -a -z "$SOLR_SLAVE_REPLICATEDAT" -a "$SOLR_SLAVE_REPLICATING" == "true" ]
+      then
+        # Everything is ok, this is the first time this core has been triggered to replicate.
+        OUT="${OUT}Core \"${CORE}\" is replicating for the first time.\n"
+      else 
+        if [ \( -n "$SOLR_SLAVE_FAILEDAT" -a -z "$SOLR_SLAVE_REPLICATEDAT" \) -o \( -z "$SOLR_SLAVE_FAILEDAT" -a -z "$SOLR_SLAVE_REPLICATEDAT" \) ]
+        then
+          # This core has never replicated, this is an error.
+          OUT="${OUT}Core \"${CORE}\" has problems replicating.\n"
+          EXIT_CODE=1
+        else
+          # We need to calculate if the last replication attempt was successfull.
+          WORKED=`date -d "$SOLR_SLAVE_REPLICATEDAT" +%s`
+          NOW=`date -d "now - $SOLR_TIME_DIFF seconds" +%s`
+        
+          # If the slave never had trouble replicating, just verify that either the timestamp is not older then 2 hours and if it is check that indexversions match.
+          if [ -z "$SOLR_SLAVE_FAILEDAT" ]
+          then
+            if [ $WORKED -gt $NOW -o $SOLR_MASTER_INDEXVERSION = $SOLR_SLAVE_INDEXVERSION ]
+            then
+              # Everything is ok
+              OUT="${OUT}Core \"${CORE}\" is up to date.\n"
+            else
+              # Slave if outdated.
+              OUT="${OUT}Core \"${CORE}\" is behind master more then $SOLR_TIME_DIFF seconds.\n"
+              EXIT_CODE=1
+            fi
+          else
+            # Slave had troubles before, but everything might be working ok now.
+            FAILED=`date -d "$SOLR_SLAVE_FAILEDAT" +%s`
+            if [ $WORKED -ge $FAILED ]
+            then 
+              if [ $WORKED -gt $NOW -o $SOLR_MASTER_INDEXVERSION = $SOLR_SLAVE_INDEXVERSION ]
+              then
+                # Everything is ok
+                OUT="${OUT}Core \"${CORE}\" is up to date.\n"
+              else
+                # Slave if outdated.
+                OUT="${OUT}Core \"${CORE}\" is behind master more then $SOLR_TIME_DIFF seconds.\n"
+                EXIT_CODE=1
+              fi
+            else
+              OUT="${OUT}Core \"${CORE}\" is having trouble replicating.\n"
+              EXIT_CODE=1
+            fi
+          fi
+        fi
+      fi
+    else
+      # masterUrl is not set, replication is broken.
+      OUT="$OUT\n"."Core \"${CORE}\" has no masterUrl set, solr.xml misconfiguration or orphaned core."
+      EXIT_CODE=1
+    fi
+  fi
+done
+
+echo -e "$OUT"
+exit $EXIT_CODE
+      
+__END__
+      
+=pod
+      
+=head1 NAME
+    
+checksolr - Simple script to check the status of all defined cores on a solr server
+ 
+=head1 SYNOPSIS
+      
+checksolr [OPTIONS]
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--help> | B<-h>
+
+Print the brief help message and exit.
+
+=item B<--man>
+
+Print the manual page and exit.
+
+=item B<--host> | B<-H> HOST
+
+Check this host instead of localhost.
+
+=item B<--port> | B<-P> Port
+
+Use this port instead of the default(8983) to connect.
+
+=item B<--diff> | B<-D> Time difference between now and when solr last replicated
+
+Use this option to set the maximum difference in seconds between the time when the solr slave replicated and now.
+
+=item B<--slave>
+
+Perform slave checks on the host instead of ping tests.
+
+=back
+
+Use '--' to separate options and argument if it starts with '-'.
+
+=head1 ARGUMENTS
+
+This tool does not accept arguments.
+
+=head1 DESCRIPTION
+
+Simple script to run that will query the solr server for a list of defined cores
+and then verify that all of them respond to ping requests
+
+=head1 EXAMPLES
+
+  checksolr --host qa-c1-solrmst1
+  
+  checksolr --slave --host qa-c1-solrmst1
+
+=head1 AUTHOR
+
+Alexander V. Chykysh <ochykysh@magus.org.ua>
+
+=cut
