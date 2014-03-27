@@ -43,7 +43,9 @@ zk_running_ok
 </pre>
 
 Template: zbx_zookeeper_templates.xml
+
 Script: check_zookeeper_trapper.sh
+
 Zabbix conf: check_zookeeper_trapper.conf
 
 
